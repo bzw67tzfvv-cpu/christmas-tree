@@ -104,6 +104,18 @@
   .btn.off{opacity:.38}
   .btn svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 
+  #meter{
+    position:absolute;left:20px;bottom:max(150px,calc(env(safe-area-inset-bottom) + 138px));
+    display:flex;align-items:flex-end;gap:3px;height:26px;pointer-events:auto;cursor:pointer;
+    padding:8px 12px;border-radius:999px;border:1px solid rgba(170,210,250,.18);
+    background:rgba(8,18,34,.42);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+  }
+  #meter .note{font-size:11px;color:rgba(190,220,250,.75);line-height:1;margin-right:2px}
+  #meter i{display:block;width:3px;height:20%;border-radius:1px;background:rgba(150,220,255,.85);
+           box-shadow:0 0 6px rgba(120,200,255,.6);transition:height .08s linear}
+  #meter.off i{background:rgba(150,180,210,.35);box-shadow:none}
+  #meter.off .note{opacity:.4}
+
   /* ---------- 信件 ---------- */
   #letter{
     position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;
@@ -146,12 +158,15 @@
 <body>
 <canvas id="scene"></canvas>
 
+<audio id="bgm" src="music.mp3" loop preload="auto" playsinline webkit-playsinline x5-playsinline style="position:fixed;left:-4px;top:-4px;width:1px;height:1px;opacity:0;pointer-events:none"></audio>
+
 <div id="stage">
   <div id="wordmark"><span class="dot"></span><span id="wmText">GYZ</span></div>
   <div id="cap">
     <div class="big" id="capBig">MERRY CHRISTMAS</div>
     <div class="sub" id="capSub">愿你被这世界温柔照亮</div>
   </div>
+  <div id="meter" title="音乐"><span class="note">&#9834;</span><i></i><i></i><i></i><i></i></div>
   <div id="hint">轻触画面，让雪落下</div>
 </div>
 
@@ -751,14 +766,13 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 /* =========================================================
-   音乐：八音盒版 Jingle Bells（Web Audio 合成，无外部文件）
+   音乐：八音盒版 Jingle Bells
+   · 点击后立刻在手势里创建 AudioContext 并开始合成（保证出声）
+   · 同时尝试播放 music.mp3；若成功则平滑切过去（iOS/微信里更稳）
+   · 带一个电平检测，页面左下角能看到声音有没有在输出
    ========================================================= */
 const Music = (() => {
-  let actx = null, master = null, wet = null, timer = null;
-  let nextNote = 0, idx = 0, playing = false;
   const BPM = 92, BEAT = 60 / BPM;
-
-  // midi, beats
   const MELODY = [
     [64,1],[64,1],[64,2], [64,1],[64,1],[64,2],
     [64,1],[67,1],[60,1.5],[62,0.5],[64,4],
@@ -767,89 +781,145 @@ const Music = (() => {
     [64,1],[64,1],[64,2], [64,1],[64,1],[64,2],
     [64,1],[67,1],[60,1.5],[62,0.5],[64,4],
     [65,1],[65,1],[65,1.5],[65,0.5], [65,1],[64,1],[64,1],[64,0.5],[64,0.5],
-    [67,1],[67,1],[65,1],[62,1], [60,4],[0,2]
+    [67,1],[67,1],[65,1],[62,1], [60,4],[0,1]
   ];
 
-  function impulse(sec, decay) {
-    const rate = actx.sampleRate, len = rate * sec;
-    const buf = actx.createBuffer(2, len, rate);
-    for (let ch = 0; ch < 2; ch++) {
-      const d = buf.getChannelData(ch);
-      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
-    }
-    return buf;
+  const el = document.getElementById("bgm");
+  let actx = null, master = null, analyser = null, timer = null;
+  let nextNote = 0, idx = 0, playing = false, synthOn = false;
+  let mp3On = false;
+  const buf = new Uint8Array(64);
+
+  function initCtx() {
+    if (actx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    actx = new AC();
+    master = actx.createGain();
+    master.gain.value = 0.001;
+    analyser = actx.createAnalyser();
+    analyser.fftSize = 64;
+    analyser.smoothingTimeConstant = 0.75;
+    const lp = actx.createBiquadFilter();
+    lp.type = "lowpass"; lp.frequency.value = 5600;
+    master.connect(analyser);
+    analyser.connect(lp);
+    lp.connect(actx.destination);
   }
 
-  function init() {
-    actx = new (window.AudioContext || window.webkitAudioContext)();
-    master = actx.createGain(); master.gain.value = 0.0;
-    const comp = actx.createDynamicsCompressor();
-    wet = actx.createConvolver(); wet.buffer = impulse(2.6, 3.2);
-    const wetGain = actx.createGain(); wetGain.gain.value = 0.34;
-    const lp = actx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 5200;
-    master.connect(lp); lp.connect(actx.destination);
-    master.connect(wet); wet.connect(wetGain); wetGain.connect(actx.destination);
-  }
-
-  function tone(midi, when, dur, gain, dest) {
+  function tone(midi, when, dur, gain) {
     const f = 440 * Math.pow(2, (midi - 69) / 12);
     const o1 = actx.createOscillator(), o2 = actx.createOscillator();
     const g = actx.createGain(), g2 = actx.createGain();
     o1.type = "sine"; o2.type = "triangle";
     o1.frequency.value = f; o2.frequency.value = f * 2.005;
     g2.gain.value = 0.18;
-    o2.connect(g2); g2.connect(g);
-    o1.connect(g);
-    const peak = gain;
+    o2.connect(g2); g2.connect(g); o1.connect(g);
     g.gain.setValueAtTime(0, when);
-    g.gain.linearRampToValueAtTime(peak, when + 0.012);
-    g.gain.exponentialRampToValueAtTime(0.0008, when + Math.max(0.35, dur * 1.5));
-    g.connect(dest || master);
+    g.gain.linearRampToValueAtTime(gain, when + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0006, when + Math.max(0.45, dur * 1.7));
+    g.connect(master);
     o1.start(when); o2.start(when);
-    o1.stop(when + dur * 1.8 + 0.2); o2.stop(when + dur * 1.8 + 0.2);
+    o1.stop(when + dur * 1.9 + 0.2); o2.stop(when + dur * 1.9 + 0.2);
   }
 
   function schedule() {
-    if (!playing) return;
+    if (!synthOn) return;
     const ahead = actx.currentTime + 0.5;
     while (nextNote < ahead) {
       const [midi, beats] = MELODY[idx];
       const dur = beats * BEAT;
       if (midi > 0) {
-        tone(midi, nextNote, dur * 0.9, 0.13, null);
-        tone(midi + 12, nextNote, dur * 0.55, 0.022, null);
-        // 低音
-        if (idx % 4 === 0) tone(midi - 24, nextNote, BEAT * 2.4, 0.05, null);
+        tone(midi, nextNote, dur * 0.92, 0.22);
+        if (idx % 4 === 0) tone(midi - 24, nextNote, BEAT * 2.2, 0.07);
       }
       nextNote += dur;
       idx = (idx + 1) % MELODY.length;
-      if (idx === 0) nextNote += 0.6;
+      if (idx === 0) nextNote += 0.5;
+    }
+  }
+
+  function startSynth() {
+    initCtx();
+    if (!actx || synthOn) return;
+    if (actx.state === "suspended") actx.resume();
+    synthOn = true;
+    nextNote = actx.currentTime + 0.08;
+    idx = 0;
+    master.gain.cancelScheduledValues(actx.currentTime);
+    master.gain.setValueAtTime(Math.max(0.001, master.gain.value), actx.currentTime);
+    master.gain.linearRampToValueAtTime(0.9, actx.currentTime + 1.6);
+    clearInterval(timer);
+    timer = setInterval(schedule, 80);
+    schedule();
+  }
+
+  function stopSynth() {
+    if (!actx) return;
+    synthOn = false;
+    clearInterval(timer);
+    master.gain.cancelScheduledValues(actx.currentTime);
+    master.gain.setValueAtTime(master.gain.value, actx.currentTime);
+    master.gain.linearRampToValueAtTime(0.001, actx.currentTime + 0.5);
+  }
+
+  /* iOS / 微信：Web Audio 会被静音键掐掉，改用 mp3；其他环境用合成音 */
+  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+                (typeof window.WeixinJSBridge !== "undefined");
+
+  function start() {
+    if (playing && (synthOn || mp3On)) return;
+    playing = true;
+    if (isIOS && el) {
+      try {
+        el.muted = false; el.volume = 1;
+        const p = el.play();
+        if (p && p.then) {
+          p.then(() => { mp3On = true; })
+           .catch(() => { mp3On = false; if (!synthOn) startSynth(); });
+        } else {
+          mp3On = true;
+        }
+        // 600ms 内没起来就上合成音
+        setTimeout(() => { if (playing && !mp3On && !synthOn) startSynth(); }, 600);
+      } catch (e) {
+        startSynth();
+      }
+    } else {
+      startSynth();          // 桌面 / 安卓：合成音最稳
     }
   }
 
   return {
-    start() {
-      if (!actx) init();
-      if (actx.state === "suspended") actx.resume();
-      if (playing) return;
-      playing = true;
-      nextNote = actx.currentTime + 0.15;
-      idx = 0;
-      master.gain.cancelScheduledValues(actx.currentTime);
-      master.gain.setValueAtTime(master.gain.value, actx.currentTime);
-      master.gain.linearRampToValueAtTime(0.55, actx.currentTime + 2.5);
-      timer = setInterval(schedule, 90);
-      schedule();
-    },
+    start,
     stop() {
-      if (!actx) return;
       playing = false;
-      clearInterval(timer);
-      master.gain.cancelScheduledValues(actx.currentTime);
-      master.gain.setValueAtTime(master.gain.value, actx.currentTime);
-      master.gain.linearRampToValueAtTime(0, actx.currentTime + 1.2);
+      mp3On = false;
+      if (el) { try { el.pause(); } catch (e) {} }
+      stopSynth();
     },
-    get playing() { return playing; }
+    resume() {
+      if (!playing) return;
+      if (actx && actx.state === "suspended") actx.resume();
+      if (el && mp3On && el.paused) { const p = el.play(); if (p && p.catch) p.catch(() => {}); }
+    },
+    /* 0~1 的实时电平，用来驱动页面上的小电平条 */
+    level() {
+      if (!analyser) return 0;
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
+      return Math.sqrt(sum / buf.length);
+    },
+    get playing() { return playing; },
+    get state() {
+      return {
+        ctx: actx ? actx.state : "none",
+        synth: synthOn,
+        mp3: mp3On,
+        gain: master ? Number(master.gain.value.toFixed(3)) : 0
+      };
+    }
   };
 })();
 
@@ -922,7 +992,34 @@ canvas.addEventListener("pointerdown", () => {
 });
 
 window.addEventListener("resize", () => { clearTimeout(window.__rz); window.__rz = setTimeout(layout, 180); });
-document.addEventListener("visibilitychange", () => { last = performance.now(); });
+document.addEventListener("visibilitychange", () => {
+  last = performance.now();
+  if (document.visibilityState === "visible") { try { Music.resume(); } catch (e) {} }
+});
+
+
+/* ---------- 音乐电平表 ---------- */
+(() => {
+  const meter = document.getElementById("meter");
+  if (!meter) return;
+  const bars = [...meter.querySelectorAll("i")];
+  meter.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (Music.playing) { Music.stop(); meter.classList.add("off"); }
+    else { Music.start(); meter.classList.remove("off"); }
+  });
+  setInterval(() => {
+    const st = Music.state;
+    // mp3 播放时测不到电平（不走 analyser），用呼吸式动画代替
+    const lv = st.mp3
+      ? 0.55 + 0.3 * Math.sin(performance.now() / 240)
+      : Math.min(1, Music.level() * 7);
+    bars.forEach((b, k) => {
+      const v = Math.max(0, lv - k * 0.12);
+      b.style.height = (14 + v * 86).toFixed(0) + "%";
+    });
+  }, 90);
+})();
 
 /* 首次布局 */
 layout();
