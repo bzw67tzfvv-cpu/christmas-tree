@@ -104,16 +104,6 @@
   .btn.off{opacity:.38}
   .btn svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 
-  #audioHint{
-    position:fixed;left:50%;bottom:max(96px,calc(env(safe-area-inset-bottom) + 84px));
-    transform:translate(-50%,8px);z-index:26;padding:9px 17px;border-radius:999px;
-    background:rgba(10,22,38,.78);border:1px solid rgba(160,200,245,.32);
-    font-size:11.5px;letter-spacing:.16em;color:rgba(226,242,255,.92);
-    backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);cursor:pointer;
-    opacity:0;visibility:hidden;transition:opacity .45s ease,transform .45s ease,visibility .45s;
-  }
-  #audioHint.on{opacity:1;visibility:visible;transform:translate(-50%,0)}
-
   /* ---------- 信件 ---------- */
   #letter{
     position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;
@@ -156,8 +146,6 @@
 <body>
 <canvas id="scene"></canvas>
 
-<audio id="bgm" src="music.mp3" loop preload="auto" playsinline webkit-playsinline x5-playsinline style="position:fixed;left:-4px;top:-4px;width:1px;height:1px;opacity:0;pointer-events:none"></audio>
-
 <div id="stage">
   <div id="wordmark"><span class="dot"></span><span id="wmText">GYZ</span></div>
   <div id="cap">
@@ -166,8 +154,6 @@
   </div>
   <div id="hint">轻触画面，让雪落下</div>
 </div>
-
-<div id="audioHint"><span>&#9834; 点这里开启音乐</span></div>
 
 <div id="openLetter"><span id="openLetterBtn">写给你的一封信</span></div>
 
@@ -765,13 +751,14 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 /* =========================================================
-   音乐：八音盒版 Jingle Bells
-   1) 优先播放同目录的 music.mp3（微信 iOS 对真实音频文件最友好）
-   2) 微信里用 WeixinJSBridgeReady + 首次触摸做“解锁”，再在点击时播放
-   3) 万一 mp3 加载失败，现场离线合成一段 WAV 顶上
+   音乐：八音盒版 Jingle Bells（Web Audio 合成，无外部文件）
    ========================================================= */
 const Music = (() => {
+  let actx = null, master = null, wet = null, timer = null;
+  let nextNote = 0, idx = 0, playing = false;
   const BPM = 92, BEAT = 60 / BPM;
+
+  // midi, beats
   const MELODY = [
     [64,1],[64,1],[64,2], [64,1],[64,1],[64,2],
     [64,1],[67,1],[60,1.5],[62,0.5],[64,4],
@@ -780,220 +767,91 @@ const Music = (() => {
     [64,1],[64,1],[64,2], [64,1],[64,1],[64,2],
     [64,1],[67,1],[60,1.5],[62,0.5],[64,4],
     [65,1],[65,1],[65,1.5],[65,0.5], [65,1],[64,1],[64,1],[64,0.5],[64,0.5],
-    [67,1],[67,1],[65,1],[62,1], [60,4],[0,1]
+    [67,1],[67,1],[65,1],[62,1], [60,4],[0,2]
   ];
 
-  const el = document.getElementById("bgm");
-  let playing = false, primed = false, fallbackDone = false;
-  // 兜底：实时合成
-  let actx = null, master = null, timer = null, nextNote = 0, idx = 0, synthOn = false;
-
-  const hintEl = () => document.getElementById("audioHint");
-  function showHint() { const h = hintEl(); if (h) h.classList.add("on"); }
-  function hideHint() { const h = hintEl(); if (h) h.classList.remove("on"); }
-  function markBtn(on) { const b = document.getElementById("btnMusic"); if (b) b.classList.toggle("off", !on); }
-
-  /* iOS / 微信：先用静音播放“解锁”一次媒体元素，之后点击才能直接出声 */
-  function prime() {
-    if (!el || primed) return;
-    primed = true;
-    try {
-      el.muted = true;
-      const p = el.play();
-      if (p && p.then) {
-        p.then(() => {
-          try { el.pause(); el.currentTime = 0; } catch (e) {}
-          el.muted = false;
-        }).catch(() => { el.muted = false; });
-      } else {
-        try { el.pause(); el.currentTime = 0; } catch (e) {}
-        el.muted = false;
-      }
-    } catch (e) { el.muted = false; }
-  }
-
-  /* ---------- 兜底：mp3 加载失败时现场合成 WAV ---------- */
-  async function render() {
-    const SR = 22050;
-    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    if (!OAC) return null;
-    const dur = MELODY.reduce((s, n) => s + n[1], 0) * BEAT + 2.8;
-    const oc = new OAC(1, Math.ceil(dur * SR), SR);
-    const out = oc.createGain(); out.gain.value = 0.95;
-    const lp = oc.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 4800;
-    out.connect(lp); lp.connect(oc.destination);
-    const dly = oc.createDelay(1.0); dly.delayTime.value = 0.16;
-    const fb = oc.createGain(); fb.gain.value = 0.16;
-    const wet = oc.createGain(); wet.gain.value = 0.22;
-    dly.connect(fb); fb.connect(dly); dly.connect(wet); wet.connect(out);
-    let t = 0.06;
-    for (const [midi, beats] of MELODY) {
-      const d = beats * BEAT;
-      if (midi > 0) {
-        const f = 440 * Math.pow(2, (midi - 69) / 12);
-        [[1, 0.30], [2.01, 0.075], [3.02, 0.028]].forEach(([mul, amp]) => {
-          const o = oc.createOscillator(); o.type = "sine"; o.frequency.value = f * mul;
-          const g = oc.createGain();
-          g.gain.setValueAtTime(0, t);
-          g.gain.linearRampToValueAtTime(amp, t + 0.01);
-          g.gain.exponentialRampToValueAtTime(0.0004, t + Math.max(0.5, d * 1.7));
-          o.connect(g); g.connect(out); g.connect(dly);
-          o.start(t); o.stop(t + Math.max(0.7, d * 1.9));
-        });
-      }
-      t += d;
+  function impulse(sec, decay) {
+    const rate = actx.sampleRate, len = rate * sec;
+    const buf = actx.createBuffer(2, len, rate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
     }
-    return oc.startRendering();
+    return buf;
   }
 
-  function encodeWav(buf) {
-    const ch = buf.numberOfChannels, len = buf.length, sr = buf.sampleRate;
-    const bytes = 44 + len * ch * 2;
-    const ab = new ArrayBuffer(bytes), dv = new DataView(ab);
-    const str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
-    str(0, "RIFF"); dv.setUint32(4, bytes - 8, true); str(8, "WAVE");
-    str(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, ch, true);
-    dv.setUint32(24, sr, true); dv.setUint32(28, sr * ch * 2, true);
-    dv.setUint16(32, ch * 2, true); dv.setUint16(34, 16, true);
-    str(36, "data"); dv.setUint32(40, len * ch * 2, true);
-    let off = 44;
-    const chans = [];
-    for (let c = 0; c < ch; c++) chans.push(buf.getChannelData(c));
-    for (let i = 0; i < len; i++) {
-      for (let c = 0; c < ch; c++) {
-        let s = Math.max(-1, Math.min(1, chans[c][i]));
-        dv.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-        off += 2;
-      }
-    }
-    return ab;
-  }
-
-  async function makeFallback() {
-    if (fallbackDone || !el) return;
-    fallbackDone = true;
-    try {
-      const buf = await render();
-      if (!buf) return;
-      const wav = new Blob([encodeWav(buf)], { type: "audio/wav" });
-      el.src = URL.createObjectURL(wav);
-      el.load();
-      if (playing) { const p = el.play(); if (p && p.catch) p.catch(() => {}); }
-    } catch (e) {}
-  }
-
-  /* ---------- 兜底：Web Audio 实时合成 ---------- */
-  function synthInit() {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return false;
-    actx = new AC();
-    master = actx.createGain(); master.gain.value = 0;
-    const lp = actx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 5000;
+  function init() {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    master = actx.createGain(); master.gain.value = 0.0;
+    const comp = actx.createDynamicsCompressor();
+    wet = actx.createConvolver(); wet.buffer = impulse(2.6, 3.2);
+    const wetGain = actx.createGain(); wetGain.gain.value = 0.34;
+    const lp = actx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 5200;
     master.connect(lp); lp.connect(actx.destination);
-    return true;
+    master.connect(wet); wet.connect(wetGain); wetGain.connect(actx.destination);
   }
-  function synthTone(midi, when, dur, gain) {
+
+  function tone(midi, when, dur, gain, dest) {
     const f = 440 * Math.pow(2, (midi - 69) / 12);
-    const o = actx.createOscillator(), o2 = actx.createOscillator();
+    const o1 = actx.createOscillator(), o2 = actx.createOscillator();
     const g = actx.createGain(), g2 = actx.createGain();
-    o.type = "sine"; o2.type = "triangle";
-    o.frequency.value = f; o2.frequency.value = f * 2.005;
-    g2.gain.value = 0.16;
-    o2.connect(g2); g2.connect(g); o.connect(g);
+    o1.type = "sine"; o2.type = "triangle";
+    o1.frequency.value = f; o2.frequency.value = f * 2.005;
+    g2.gain.value = 0.18;
+    o2.connect(g2); g2.connect(g);
+    o1.connect(g);
+    const peak = gain;
     g.gain.setValueAtTime(0, when);
-    g.gain.linearRampToValueAtTime(gain, when + 0.012);
-    g.gain.exponentialRampToValueAtTime(0.0006, when + Math.max(0.4, dur * 1.6));
-    g.connect(master);
-    o.start(when); o2.start(when);
-    o.stop(when + dur * 1.9 + 0.2); o2.stop(when + dur * 1.9 + 0.2);
+    g.gain.linearRampToValueAtTime(peak, when + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0008, when + Math.max(0.35, dur * 1.5));
+    g.connect(dest || master);
+    o1.start(when); o2.start(when);
+    o1.stop(when + dur * 1.8 + 0.2); o2.stop(when + dur * 1.8 + 0.2);
   }
-  function synthSchedule() {
-    if (!synthOn) return;
+
+  function schedule() {
+    if (!playing) return;
     const ahead = actx.currentTime + 0.5;
     while (nextNote < ahead) {
       const [midi, beats] = MELODY[idx];
       const dur = beats * BEAT;
-      if (midi > 0) synthTone(midi, nextNote, dur * 0.9, 0.13);
+      if (midi > 0) {
+        tone(midi, nextNote, dur * 0.9, 0.13, null);
+        tone(midi + 12, nextNote, dur * 0.55, 0.022, null);
+        // 低音
+        if (idx % 4 === 0) tone(midi - 24, nextNote, BEAT * 2.4, 0.05, null);
+      }
       nextNote += dur;
       idx = (idx + 1) % MELODY.length;
       if (idx === 0) nextNote += 0.6;
     }
   }
-  function synthStart() {
-    if (synthOn) return;
-    if (!actx && !synthInit()) return;
-    if (actx.state === "suspended") actx.resume();
-    synthOn = true;
-    nextNote = actx.currentTime + 0.12; idx = 0;
-    master.gain.cancelScheduledValues(actx.currentTime);
-    master.gain.setValueAtTime(master.gain.value, actx.currentTime);
-    master.gain.linearRampToValueAtTime(0.5, actx.currentTime + 2.0);
-    clearInterval(timer); timer = setInterval(synthSchedule, 90);
-    synthSchedule();
-  }
-  function synthStop() {
-    if (!actx) return;
-    synthOn = false;
-    clearInterval(timer);
-    master.gain.cancelScheduledValues(actx.currentTime);
-    master.gain.setValueAtTime(master.gain.value, actx.currentTime);
-    master.gain.linearRampToValueAtTime(0, actx.currentTime + 0.8);
-  }
-
-  if (el) {
-    el.addEventListener("error", makeFallback);
-    el.addEventListener("stalled", () => { if (playing) makeFallback(); });
-    el.addEventListener("ended", () => {
-      if (!playing) return;
-      try { el.currentTime = 0; const p = el.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
-    });
-  }
-
-  function start() {
-    if (!el) { synthStart(); markBtn(true); return; }
-    if (playing && !el.paused) return;
-    el.muted = false;
-    playing = true;
-    const p = el.play();
-    if (p && p.catch) {
-      p.catch(() => {
-        playing = false;
-        synthStart();          // 有些内核 WebAudio 能出声
-        if (!synthOn) showHint();
-      });
-    }
-    markBtn(true);
-    // 兜底检测：确实没在走就提示
-    setTimeout(() => {
-      if (playing && el.paused) { playing = false; showHint(); }
-    }, 1500);
-    hideHint();
-  }
 
   return {
-    prime,
-    start,
+    start() {
+      if (!actx) init();
+      if (actx.state === "suspended") actx.resume();
+      if (playing) return;
+      playing = true;
+      nextNote = actx.currentTime + 0.15;
+      idx = 0;
+      master.gain.cancelScheduledValues(actx.currentTime);
+      master.gain.setValueAtTime(master.gain.value, actx.currentTime);
+      master.gain.linearRampToValueAtTime(0.55, actx.currentTime + 2.5);
+      timer = setInterval(schedule, 90);
+      schedule();
+    },
     stop() {
+      if (!actx) return;
       playing = false;
-      if (el) { try { el.pause(); } catch (e) {} }
-      if (synthOn) synthStop();
-      markBtn(false);
+      clearInterval(timer);
+      master.gain.cancelScheduledValues(actx.currentTime);
+      master.gain.setValueAtTime(master.gain.value, actx.currentTime);
+      master.gain.linearRampToValueAtTime(0, actx.currentTime + 1.2);
     },
-    resume() {
-      if (playing && el && el.paused) { const p = el.play(); if (p && p.catch) p.catch(() => {}); }
-      if (playing && synthOn && actx && actx.state === "suspended") actx.resume();
-    },
-    get playing() { return playing; },
-    get usingSynth() { return synthOn; }
+    get playing() { return playing; }
   };
 })();
-
-/* 微信：JSBridge 就绪和第一次触摸时各解锁一次 */
-if (window.WeixinJSBridge) { try { Music.prime(); } catch (e) {} }
-document.addEventListener("WeixinJSBridgeReady", () => { try { Music.prime(); } catch (e) {} }, false);
-document.addEventListener("touchstart", () => { try { Music.prime(); } catch (e) {} }, { once: true, passive: true });
-document.addEventListener("click", () => { try { Music.prime(); } catch (e) {} }, { once: true });
-setTimeout(() => { try { Music.prime(); } catch (e) {} }, 900);
 
 /* =========================================================
    交互
@@ -1064,10 +922,7 @@ canvas.addEventListener("pointerdown", () => {
 });
 
 window.addEventListener("resize", () => { clearTimeout(window.__rz); window.__rz = setTimeout(layout, 180); });
-document.addEventListener("visibilitychange", () => {
-  last = performance.now();
-  if (document.visibilityState === "visible") { try { Music.resume(); } catch (e) {} }
-});
+document.addEventListener("visibilitychange", () => { last = performance.now(); });
 
 /* 首次布局 */
 layout();
